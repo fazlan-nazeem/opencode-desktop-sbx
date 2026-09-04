@@ -1,0 +1,184 @@
+schemaVersion: "2"
+kind: mixin
+name: opencode-desktop
+displayName: OpenCode Desktop
+description: Installs the OpenCode desktop app (Electron) from its GitHub release .deb and launches it as a native window on the host desktop. Requires `--display` at sandbox creation time and the `feature.sandbox-display` feature flag — see the README.
+permissions:
+  network:
+    allow:
+      # setup.install runs apt-get update, which refreshes every configured
+      # apt source regardless of which package actually needs it — apt-get
+      # exits 100 on the first source metadata fetch that returns non-2xx.
+      # Ubuntu hosts amd64 packages on archive/security and arm64 packages
+      # on ports.ubuntu.com, so all three Ubuntu hosts are listed for
+      # cross-arch coverage. download.docker.com covers base templates
+      # (e.g. opencode-docker, claude-code-docker) that pre-configure
+      # Docker's apt repo.
+      - archive.ubuntu.com
+      - security.ubuntu.com
+      - ports.ubuntu.com
+      - download.docker.com
+      # Install-time: the release page redirects through github.com to one
+      # of GitHub's release-asset CDN hosts. Which host it lands on has
+      # varied historically, so both are allowed (same gap noted in
+      # aider/spec.yaml and kernel/spec.yaml in this repo).
+      - github.com
+      - objects.githubusercontent.com
+      - release-assets.githubusercontent.com
+      # Runtime: the desktop app's own update-check feed (electron-builder's
+      # generic GitHub provider) hits the same three hosts above, so no
+      # extra egress is needed for that.
+agentInstructions:
+  content: |
+    ## OpenCode Desktop
+
+    The OpenCode desktop app is running inside this sandbox. Its window is
+    visible on the host desktop — it's the full OpenCode agent (not just an
+    editor), so it can run its own sessions independently of any terminal
+    agent sharing this sandbox. Paired with the built-in `opencode` base
+    agent, both the terminal TUI and this desktop window are the same
+    underlying tool, sharing the workspace.
+
+    If the user closes the window and wants to reopen it, run
+    `opencode-desktop &` from any terminal inside the sandbox.
+
+    If the window is not visible at all, check that `--display` was passed
+    at sandbox creation time and that the host compositor is running. The
+    process runs backgrounded; it does not produce a log file by default.
+
+    The app reads its config from the same place the CLI does
+    (~/.config/opencode/opencode.json) — it's the same OpenCode core, just
+    an Electron shell. Paired with the built-in `opencode` base agent, its
+    provider network allow-list and credential injection (Anthropic,
+    OpenAI, GitHub Copilot, Google, Groq, OpenRouter, xAI) already cover the
+    desktop app too, since both are sandbox-wide. Paired with a different
+    base agent, none of that comes along — see the README's "Model provider
+    access" section for what to allow manually.
+setup:
+  install:
+    - command: |
+        set -euo pipefail
+
+        # apt's InRelease verification uses O_TMPFILE, which is incompatible
+        # with the virtiofs overlay backing the container. Route the lists
+        # directory through /dev/shm (a plain tmpfs) instead. The .deb cache
+        # stays at its default location (/var/cache/apt/archives) because
+        # /dev/shm's 64 MiB ceiling is too small for the full package set.
+        #
+        # That same 64 MiB ceiling is too small even for just the *lists* if
+        # every configured source is left as-is: the base templates' sources
+        # span main+universe+restricted+multiverse across 4 suites (plus
+        # Docker's own repo), and the decompressed indexes blow well past
+        # 64 MiB, failing apt-get update with "No space left on device"
+        # (verified against docker/sandbox-templates:claude-code-docker).
+        # Every package this kit installs resolves from `main`, so strip
+        # universe/multiverse from filtered copies of the source files
+        # (written to /dev/shm, not back over the real ones) instead of
+        # trying to shrink or resize the tmpfs itself — mount() for a bigger
+        # one is refused inside the sandbox (no CAP_SYS_ADMIN).
+        mkdir -p /dev/shm/apt-lists /dev/shm/apt-sources.list.d
+        for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+          [ -f "$f" ] || continue
+          sed -E 's/\b(universe|multiverse)\b//g' "$f" > "/dev/shm/apt-sources.list.d/$(basename "$f")"
+        done
+        APT_OPTS="-o DPkg::Lock::Timeout=600 -o Dir::State::Lists=/dev/shm/apt-lists -o Dir::Etc::sourcelist=/dev/null -o Dir::Etc::sourceparts=/dev/shm/apt-sources.list.d"
+        export TMPDIR=/dev/shm
+
+        apt-get $APT_OPTS update
+        # libgbm1 and libasound2t64 are NOT in the .deb's own Depends (it
+        # only declares libgtk-3-0, libnotify4, libnss3, libxss1, libxtst6,
+        # xdg-utils, libatspi2.0-0, libuuid1, libsecret-1-0), so apt never
+        # pulls them in on its own. Electron dlopens both unconditionally at
+        # startup regardless of --disable-gpu, and their absence is a hard
+        # crash, not a degraded fallback: confirmed via `ldd
+        # /opt/OpenCode/ai.opencode.desktop` against a fresh install on this
+        # same base template — both came back "not found" until added here.
+        apt-get $APT_OPTS install -yy --no-install-recommends ca-certificates curl dbus-x11 libgbm1 libasound2t64
+
+        ARCH=$(dpkg --print-architecture)
+        case "$ARCH" in
+          amd64|arm64) ;;
+          *)
+            echo "opencode-desktop: unsupported architecture '$ARCH' (upstream only ships amd64/arm64 desktop builds)" >&2
+            exit 1
+            ;;
+        esac
+
+        # "latest" rather than a pinned tag: unlike an apt repo, a GitHub
+        # release has no rolling "stable" channel to track, so this is the
+        # closest equivalent. Pin to a tag here if you need reproducibility
+        # across sandbox creations.
+        DEB_URL="https://github.com/anomalyco/opencode/releases/latest/download/opencode-desktop-linux-${ARCH}.deb"
+        curl -fsSL "$DEB_URL" -o /tmp/opencode-desktop.deb
+
+        # Installing via apt (not dpkg -i) resolves the .deb's runtime deps
+        # (libgtk-3-0, libnss3, libsecret-1-0, etc.) straight from the Ubuntu
+        # mirrors already allowed above.
+        apt-get $APT_OPTS install -yy --no-install-recommends /tmp/opencode-desktop.deb
+
+        rm -f /tmp/opencode-desktop.deb
+        rm -rf /dev/shm/apt-lists /dev/shm/apt-sources.list.d
+        apt-get clean
+      user: "0"
+      description: |
+        Install the OpenCode desktop .deb from its latest GitHub release,
+        plus dbus-x11 (which provides dbus-run-session, needed by Electron
+        to wire its IPC bus when no session bus is present in the container).
+
+  files:
+    - path: /home/agent/.local/bin/opencode-desktop
+      mode: "0755"
+      description: Launch wrapper written at each startup so WORKSPACE_DIR is resolved at runtime.
+      content: |
+        #!/bin/sh
+        # A background startup command's stdout/stderr is discarded by the
+        # runtime (there's no client attached to see it), so without this
+        # redirect a launch failure here — including the friendly error
+        # messages below — is completely invisible. Resolve HOME first so
+        # there's somewhere to put the log before anything can fail.
+        HOME_DIR=$(getent passwd 1000 | cut -d: -f6)
+        if [ -z "$HOME_DIR" ]; then
+          echo "opencode-desktop: no user at uid 1000" >&2
+          exit 1
+        fi
+        export HOME="$HOME_DIR"
+        mkdir -p "$HOME_DIR/.local/state"
+        exec > "$HOME_DIR/.local/state/opencode-desktop.log" 2>&1
+        echo "opencode-desktop: starting at $(date)"
+
+        if [ ! -S /run/display/wayland-0 ]; then
+          echo "opencode-desktop: display socket not found at /run/display/wayland-0"
+          echo "This sandbox was not created with --display."
+          echo ""
+          echo "To fix, enable the experimental display feature and recreate:"
+          echo "  sbx settings set platform.allowExperimentalFeatures true"
+          echo "  sbx settings set feature.sandbox-display true"
+          echo "  sbx run opencode --display --kit <this-kit> <workspace>"
+          exit 1
+        fi
+        export WAYLAND_DISPLAY=/run/display/wayland-0
+        LAUNCH_DIR="$WORKSPACE_DIR"
+        if [ -z "$LAUNCH_DIR" ]; then LAUNCH_DIR="$HOME_DIR"; fi
+        exec dbus-run-session /opt/OpenCode/ai.opencode.desktop \
+          --ozone-platform=wayland \
+          --disable-gpu \
+          --disable-gpu-compositing \
+          --no-sandbox \
+          --disable-dev-shm-usage \
+          "$LAUNCH_DIR"
+
+  startup:
+    - command:
+        - setpriv
+        - --reuid=1000
+        - --regid=1000
+        - --init-groups
+        - /home/agent/.local/bin/opencode-desktop
+      user: "0"
+      background: true
+      description: |
+        Launch OpenCode Desktop as a Wayland client opening the sandbox's
+        workspace. Runs as root then drops to uid 1000 via setpriv. The
+        window appears on the host compositor via the display surface
+        provisioned by --display. Backgrounded so the agent's terminal
+        keeps focus.
