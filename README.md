@@ -106,7 +106,45 @@ doesn't reliably grant; the sandbox container itself is the security
 boundary here, same as every other Electron-based kit in this repo (see
 [`vscode/`](../vscode)).
 
+## The window-show workaround
+
+OpenCode Desktop does not open its window on its own under Wayland, so this
+kit patches the installed `app.asar` at install time. Without the patch the
+app starts, its backend comes up and the renderer loads, but no window ever
+appears.
+
+The app creates its `BrowserWindow` with `show: false` and only calls
+`win.show()` from the `ready-to-show` event. Electron drives that event from
+Chromium's first-visually-non-empty-paint, and an unmapped Ozone/Wayland
+window is never sent frames, so the renderer never paints at all. No paint,
+no `ready-to-show`, no `show()`, and the window is never mapped. Reading paint
+timings out of the live renderer shows zero `performance` paint entries while
+hidden, and a `first-paint` entry appearing only at the instant `show()` is
+called.
+
+This is not specific to any one compositor: it reproduces under a stock
+upstream Weston too, and a trivial Electron window built from the same binary
+with the same window options gets `ready-to-show` in about 0.2s.
+`--disable-gpu` is not the cause (it fails with SwiftShader too), nor is a
+missing D-Bus system bus or `xdg-desktop-portal`, nor renderer/occlusion
+throttling.
+
+The patch flips `show: false` to `show: true` in place. The replacement is the
+same byte length, so the asar's offset table stays valid and the archive needs
+no repack. Because the anchor is minified output that will drift between
+releases, the install step fails loudly if it does not match exactly once —
+better a failed install than a silent return to an invisible window.
+
+The real fix belongs upstream: `show()` should fall back to `did-finish-load`
+or a timeout rather than depending solely on `ready-to-show`.
+
 ## Troubleshooting
+
+**Install fails with "expected exactly one 'show: false' anchor"**
+
+Upstream changed how the main window is created, so the patch above no longer
+applies. The app will still install by hand, but it will not show a window
+until the workaround is re-derived against the new release.
 
 **Window doesn't appear**
 

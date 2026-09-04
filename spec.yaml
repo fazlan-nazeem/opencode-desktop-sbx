@@ -116,6 +116,48 @@ setup:
         # mirrors already allowed above.
         apt-get $APT_OPTS install -yy --no-install-recommends /tmp/opencode-desktop.deb
 
+        # Force the main window to be mapped at creation.
+        #
+        # The app builds its BrowserWindow with `show: false` and only calls
+        # win.show() from the 'ready-to-show' event. Electron drives that event
+        # from Chromium's first-visually-non-empty-paint, but an unmapped
+        # Ozone/Wayland window is never sent frames, so the renderer never
+        # paints at all: no paint -> no ready-to-show -> no show() -> the
+        # window is never mapped. Confirmed by reading paint timings out of the
+        # live renderer, which reports zero performance paint entries while
+        # hidden and its first-paint only at the instant show() is called.
+        #
+        # Not specific to any one compositor: it reproduces under a stock
+        # upstream Weston too, and a trivial Electron window built from the
+        # same binary with the same window options gets ready-to-show in about
+        # 0.2s. Upstream should gate show() on did-finish-load or a timeout
+        # instead; until then, mapping the window up front lets frames flow and
+        # the UI paints normally.
+        #
+        # `show: true ` is the same byte length as `show: false`, so the asar's
+        # offset table stays valid and the archive needs no repack. The anchor
+        # is minified output and will drift, so bail out loudly rather than
+        # silently regress to an invisible window on a future release.
+        ASAR=/opt/OpenCode/resources/app.asar
+        if LC_ALL=C grep -aq 'show: true ,' "$ASAR"; then
+          echo "opencode-desktop: app.asar already patched, skipping"
+        else
+          ANCHORS=$(LC_ALL=C grep -abo '    show: false,' "$ASAR" || true)
+          FOUND=$(printf '%s\n' "$ANCHORS" | sed '/^$/d' | wc -l | tr -d ' ')
+          if [ "$FOUND" != "1" ]; then
+            echo "opencode-desktop: expected exactly one 'show: false' anchor in app.asar, found $FOUND" >&2
+            echo "Upstream window creation has changed; re-check this workaround before shipping." >&2
+            exit 1
+          fi
+          OFFSET=${ANCHORS%%:*}
+          printf 'show: true ,' | dd of="$ASAR" bs=1 seek=$((OFFSET + 4)) conv=notrunc status=none
+          LC_ALL=C grep -aq 'show: true ,' "$ASAR" || {
+            echo "opencode-desktop: app.asar patch verification failed" >&2
+            exit 1
+          }
+          echo "opencode-desktop: patched app.asar at offset $((OFFSET + 4))"
+        fi
+
         rm -f /tmp/opencode-desktop.deb
         rm -rf /dev/shm/apt-lists /dev/shm/apt-sources.list.d
         apt-get clean
